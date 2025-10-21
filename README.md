@@ -226,7 +226,7 @@ This creates a smaller executable, but users must install FFmpeg separately.
 
 ## License
 
-This project is provided as-is for educational and personal use.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Credits
 
