@@ -14,23 +14,56 @@ try:
 except ImportError:
     DRAG_DROP_AVAILABLE = False
 
+# On Windows, ffmpeg/ffprobe are console programs, so every subprocess call
+# would flash a console window over the GUI unless CREATE_NO_WINDOW is set.
+# The attribute only exists on Windows; 0 is a no-op elsewhere.
+SUBPROCESS_FLAGS = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+# Audio is always re-encoded at this bitrate
+AUDIO_BITRATE_KBPS = 128
+
+
+def calculate_video_bitrate(max_size_mb, duration_seconds, source_bitrate_k=None,
+                            audio_bitrate_k=AUDIO_BITRATE_KBPS):
+    """Target video bitrate in kbps so video + audio fit within max_size_mb.
+
+    Returns None if the budget can't even hold the audio. Capped at the
+    source video bitrate when known — encoding above the source bitrate
+    only pads the file without adding quality.
+    """
+    # 5% safety margin so the output never exceeds the user's limit
+    target_size_bits = max_size_mb * 0.95 * 8 * 1024 * 1024
+    audio_size_bits = audio_bitrate_k * 1024 * duration_seconds
+    video_size_bits = target_size_bits - audio_size_bits
+
+    if video_size_bits <= 0:
+        return None
+
+    bitrate_k = int(video_size_bits / duration_seconds / 1024)
+    if source_bitrate_k is not None and bitrate_k > source_bitrate_k:
+        bitrate_k = source_bitrate_k
+    return max(1, bitrate_k)
+
 
 class VideoCompressorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Video Compressor")
-        self.root.geometry("600x570")
+        self.root.geometry("650x920")
         self.root.resizable(False, False)
         
         # Variables
         self.input_file = tk.StringVar()
         self.output_file = tk.StringVar()
-        self.max_size_mb = tk.StringVar(value="25")
+        self.max_size_mb = tk.StringVar(value="10")
         self.start_time = tk.StringVar(value="00:00:00")
         self.end_time = tk.StringVar(value="")
         self.use_gpu = tk.BooleanVar(value=False)
         self.processing = False
         self.gpu_available = False
+        self.video_duration = 0
+        self.thumbnails = []
+        self.timeline_loaded = False
         
         self.setup_ui()
         self.setup_drag_drop()
@@ -87,6 +120,51 @@ class VideoCompressorGUI:
         tk.Label(end_frame, text="End Time (HH:MM:SS or seconds, leave empty for end):", font=("Arial", 10)).pack(anchor="w")
         tk.Entry(end_frame, textvariable=self.end_time, width=20).pack(anchor="w", pady=5)
         
+        # Video preview frame
+        self.preview_frame = tk.Frame(self.root)
+        self.preview_frame.pack(fill="x", padx=20, pady=10)
+        
+        self.preview_label_text = tk.Label(self.preview_frame, text="Video Preview:", font=("Arial", 10))
+        self.preview_label_text.pack(anchor="w")
+        
+        self.preview_canvas = tk.Canvas(self.preview_frame, width=320, height=180, bg="#1a1a1a", highlightthickness=1, highlightbackground="#555")
+        self.preview_canvas.pack(pady=5)
+        
+        self.preview_time_label = tk.Label(self.preview_frame, text="", font=("Arial", 9), fg="#888")
+        self.preview_time_label.pack()
+        
+        self.preview_photo = None  # Keep reference to prevent garbage collection
+        self.current_video_path = None
+        self.scrub_job = None  # For debouncing scrub updates
+        
+        # Timeline frame for video trimming
+        self.timeline_frame = tk.Frame(self.root)
+        self.timeline_frame.pack(fill="x", padx=20, pady=10)
+        
+        tk.Label(self.timeline_frame, text="Video Timeline (drag handles to trim):", font=("Arial", 10)).pack(anchor="w")
+        
+        # Timeline canvas
+        self.timeline_canvas = tk.Canvas(self.timeline_frame, height=70, bg="#2a2a2a", highlightthickness=1, highlightbackground="#555")
+        self.timeline_canvas.pack(fill="x", pady=5)
+        
+        # Timeline placeholder text
+        self.timeline_placeholder = self.timeline_canvas.create_text(
+            300, 35, text="Load a video to see timeline", fill="#888", font=("Arial", 10)
+        )
+        
+        # Timeline variables
+        self.timeline_width = 0
+        self.handle_left_x = 0
+        self.handle_right_x = 0
+        self.dragging_handle = None
+        self.handle_width = 12
+        
+        # Bind canvas events
+        self.timeline_canvas.bind("<Configure>", self.on_timeline_configure)
+        self.timeline_canvas.bind("<Button-1>", self.on_timeline_click)
+        self.timeline_canvas.bind("<B1-Motion>", self.on_timeline_drag)
+        self.timeline_canvas.bind("<ButtonRelease-1>", self.on_timeline_release)
+        
         # GPU acceleration checkbox
         gpu_frame = tk.Frame(self.root)
         gpu_frame.pack(fill="x", padx=20, pady=5)
@@ -112,11 +190,21 @@ class VideoCompressorGUI:
         self.progress_bar = ttk.Progressbar(self.progress_frame, mode='indeterminate')
         self.progress_bar.pack(fill="x", pady=5)
         
+        # Button frame for compress and reset buttons
+        button_frame = tk.Frame(self.root)
+        button_frame.pack(pady=20)
+        
         # Compress button
-        self.compress_btn = tk.Button(self.root, text="Compress Video", command=self.start_compression,
+        self.compress_btn = tk.Button(button_frame, text="Compress Video", command=self.start_compression,
                                        bg="#4CAF50", fg="white", font=("Arial", 12, "bold"),
                                        padx=20, pady=10)
-        self.compress_btn.pack(pady=20)
+        self.compress_btn.pack(side="left", padx=5)
+        
+        # Reset button (initially hidden)
+        self.reset_btn = tk.Button(button_frame, text="Reset", command=self.reset_form,
+                                    bg="#2196F3", fg="white", font=("Arial", 12, "bold"),
+                                    padx=20, pady=10)
+        # Don't pack initially - will be shown after compression completes
         
     def setup_drag_drop(self):
         """Setup drag-and-drop functionality for input files."""
@@ -160,6 +248,11 @@ class VideoCompressorGUI:
                 if not self.output_file.get():
                     base, ext = os.path.splitext(file_path)
                     self.output_file.set(f"{base}_compressed{ext}")
+                # Load video timeline
+                self.current_video_path = file_path
+                self.load_video_timeline(file_path)
+                # Show reset button
+                self.reset_btn.pack(side="left", padx=5)
                 return 'break'
         except Exception as e:
             print(f"Error handling drop: {e}")
@@ -176,6 +269,11 @@ class VideoCompressorGUI:
             if not self.output_file.get():
                 base, ext = os.path.splitext(filename)
                 self.output_file.set(f"{base}_compressed{ext}")
+            # Load video timeline
+            self.current_video_path = filename
+            self.load_video_timeline(filename)
+            # Show reset button
+            self.reset_btn.pack(side="left", padx=5)
     
     def browse_output(self):
         filename = filedialog.asksaveasfilename(
@@ -253,20 +351,17 @@ class VideoCompressorGUI:
                 self.show_error("Invalid time range. End time must be greater than start time.")
                 return
             
-            # Calculate target bitrate (in bits per second)
-            # Formula: (target_size_in_bits) / duration_in_seconds
-            # Reserve some space for audio (128 kbps) and overhead
-            target_size_bits = max_size_mb * 8 * 1024 * 1024  # Convert MB to bits
-            audio_bitrate = 128  # kbps
-            audio_size_bits = audio_bitrate * 1024 * target_duration
-            video_size_bits = target_size_bits - audio_size_bits
-            
-            if video_size_bits <= 0:
+            # Calculate target bitrate from the size budget, capped at the
+            # source bitrate so short clips trimmed from large files aren't
+            # padded up to the size limit
+            audio_bitrate = AUDIO_BITRATE_KBPS
+            source_bitrate_k = self.get_video_bitrate(input_path)
+            target_video_bitrate_k = calculate_video_bitrate(
+                max_size_mb, target_duration, source_bitrate_k, audio_bitrate)
+
+            if target_video_bitrate_k is None:
                 self.show_error("Target file size is too small for the specified duration.")
                 return
-            
-            target_video_bitrate = int(video_size_bits / target_duration)  # bits per second
-            target_video_bitrate_k = int(target_video_bitrate / 1024)  # Convert to kbps
             
             # Determine if we should use GPU
             use_gpu_encoding = self.use_gpu.get() and self.gpu_available
@@ -336,7 +431,8 @@ class VideoCompressorGUI:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                universal_newlines=True,
+                creationflags=SUBPROCESS_FLAGS
             )
             
             # Wait for completion
@@ -414,7 +510,8 @@ class VideoCompressorGUI:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                universal_newlines=True,
+                creationflags=SUBPROCESS_FLAGS
             )
             
             stdout, stderr = process.communicate()
@@ -445,7 +542,7 @@ class VideoCompressorGUI:
             video_path
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
         
         if result.returncode != 0:
             raise Exception("Could not read video duration")
@@ -465,7 +562,7 @@ class VideoCompressorGUI:
             video_path
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
         
         if result.returncode != 0:
             raise Exception("Could not read video FPS")
@@ -482,6 +579,42 @@ class VideoCompressorGUI:
         
         return fps
     
+    def get_video_bitrate(self, video_path):
+        """Get the source video bitrate in kbps using ffprobe, or None if unknown.
+
+        Prefers the video stream's own bitrate; some containers (e.g. mkv)
+        don't store per-stream bitrates, so fall back to the container-level
+        bitrate. That includes audio so it reads slightly high, but the cap
+        only needs to be the right order of magnitude.
+        """
+        ffprobe_path = get_ffmpeg_path('ffprobe')
+        cmd = [
+            ffprobe_path,
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=bit_rate:format=bit_rate',
+            '-of', 'json',
+            video_path
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+
+        if result.returncode != 0:
+            return None
+
+        try:
+            data = json.loads(result.stdout)
+        except ValueError:
+            return None
+
+        streams = data.get('streams') or [{}]
+        for rate in (streams[0].get('bit_rate'), data.get('format', {}).get('bit_rate')):
+            try:
+                return max(1, int(int(rate) / 1024))
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def get_audio_track_count(self, video_path):
         """Get the number of audio tracks using ffprobe."""
         ffprobe_path = get_ffmpeg_path('ffprobe')
@@ -494,7 +627,7 @@ class VideoCompressorGUI:
             video_path
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
         
         if result.returncode != 0:
             return 1  # Default to 1 if we can't detect
@@ -552,6 +685,338 @@ class VideoCompressorGUI:
         self.progress_label.config(text="")
         self.progress_bar.stop()
     
+    def reset_form(self):
+        """Reset the form to compress another video."""
+        self.input_file.set("")
+        self.output_file.set("")
+        self.start_time.set("00:00:00")
+        self.end_time.set("")
+        self.progress_label.config(text="")
+        # Hide reset button until next compression
+        self.reset_btn.pack_forget()
+        # Reset timeline
+        self.timeline_loaded = False
+        self.video_duration = 0
+        self.thumbnails = []
+        self.current_video_path = None
+        self.timeline_canvas.delete("all")
+        self.timeline_placeholder = self.timeline_canvas.create_text(
+            self.timeline_width // 2 if self.timeline_width > 0 else 300, 35,
+            text="Load a video to see timeline", fill="#888", font=("Arial", 10)
+        )
+        # Reset preview
+        self.preview_canvas.delete("all")
+        self.preview_time_label.config(text="")
+        self.preview_photo = None
+    
+    def on_timeline_configure(self, event):
+        """Handle timeline canvas resize."""
+        self.timeline_width = event.width
+        if self.timeline_loaded:
+            self.draw_timeline()
+        else:
+            # Update placeholder position
+            self.timeline_canvas.coords(self.timeline_placeholder, event.width // 2, 35)
+    
+    def on_timeline_click(self, event):
+        """Handle click on timeline to start dragging a handle."""
+        if not self.timeline_loaded:
+            return
+        
+        x = event.x
+        # Check if clicking on left handle
+        if abs(x - self.handle_left_x) < self.handle_width:
+            self.dragging_handle = "left"
+        # Check if clicking on right handle
+        elif abs(x - self.handle_right_x) < self.handle_width:
+            self.dragging_handle = "right"
+        else:
+            self.dragging_handle = None
+    
+    def on_timeline_drag(self, event):
+        """Handle dragging of timeline handles."""
+        if not self.timeline_loaded or not self.dragging_handle:
+            return
+        
+        x = max(self.handle_width, min(event.x, self.timeline_width - self.handle_width))
+        
+        if self.dragging_handle == "left":
+            # Don't let left handle go past right handle
+            if x < self.handle_right_x - self.handle_width * 2:
+                self.handle_left_x = x
+        elif self.dragging_handle == "right":
+            # Don't let right handle go past left handle
+            if x > self.handle_left_x + self.handle_width * 2:
+                self.handle_right_x = x
+        
+        self.draw_timeline()
+        self.update_time_from_handles()
+        
+        # Scrub video preview to current handle position
+        self.scrub_to_handle_position()
+    
+    def on_timeline_release(self, event):
+        """Handle release of timeline handle."""
+        self.dragging_handle = None
+    
+    def scrub_to_handle_position(self):
+        """Update video preview to show frame at current handle position."""
+        if not self.current_video_path or not self.dragging_handle:
+            return
+        
+        # Calculate timestamp based on which handle is being dragged
+        usable_width = self.timeline_width - self.handle_width * 2
+        if usable_width <= 0:
+            return
+        
+        if self.dragging_handle == "left":
+            ratio = (self.handle_left_x - self.handle_width) / usable_width
+        else:
+            ratio = (self.handle_right_x - self.handle_width) / usable_width
+        
+        timestamp = max(0, min(ratio * self.video_duration, self.video_duration))
+        
+        # Debounce: cancel previous job if still pending
+        if self.scrub_job:
+            self.root.after_cancel(self.scrub_job)
+        
+        # Schedule frame extraction with small delay for smoother dragging
+        self.scrub_job = self.root.after(50, lambda: self._extract_and_show_frame(timestamp))
+    
+    def _extract_and_show_frame(self, timestamp):
+        """Extract a frame at the given timestamp and display it."""
+        if not self.current_video_path:
+            return
+        
+        # Run in background thread to avoid UI lag
+        thread = threading.Thread(target=self._do_frame_extraction, args=(timestamp,))
+        thread.daemon = True
+        thread.start()
+    
+    def _do_frame_extraction(self, timestamp):
+        """Actually extract the frame (runs in background thread)."""
+        try:
+            import tempfile
+            
+            # Create temp file for the frame
+            temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+            temp_path = temp_file.name
+            temp_file.close()
+            
+            ffmpeg_path = get_ffmpeg_path('ffmpeg')
+            cmd = [
+                ffmpeg_path, '-y',
+                '-ss', str(timestamp),
+                '-i', self.current_video_path,
+                '-vframes', '1',
+                '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2',
+                temp_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, timeout=5, creationflags=SUBPROCESS_FLAGS)
+            
+            if result.returncode == 0 and os.path.exists(temp_path):
+                # Update UI on main thread
+                self.root.after(0, lambda: self._display_preview_frame(temp_path, timestamp))
+            else:
+                # Clean up on failure
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"Error extracting frame: {e}")
+    
+    def _display_preview_frame(self, frame_path, timestamp):
+        """Display the extracted frame in the preview canvas."""
+        try:
+            from PIL import Image, ImageTk
+            
+            if os.path.exists(frame_path):
+                img = Image.open(frame_path)
+                self.preview_photo = ImageTk.PhotoImage(img)
+                
+                self.preview_canvas.delete("all")
+                self.preview_canvas.create_image(160, 90, image=self.preview_photo, anchor="center")
+                
+                # Update time label
+                self.preview_time_label.config(text=f"Time: {self.format_time(timestamp)}")
+                
+                # Clean up temp file
+                try:
+                    os.unlink(frame_path)
+                except:
+                    pass
+        except ImportError:
+            # PIL not available
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_text(160, 90, text=f"Frame at {self.format_time(timestamp)}", fill="#888")
+            self.preview_time_label.config(text=f"Time: {self.format_time(timestamp)} (Install Pillow for preview)")
+        except Exception as e:
+            print(f"Error displaying frame: {e}")
+    
+    def update_time_from_handles(self):
+        """Update start/end time fields based on handle positions."""
+        if not self.timeline_loaded or self.video_duration <= 0:
+            return
+        
+        usable_width = self.timeline_width - self.handle_width * 2
+        
+        # Calculate time from handle positions
+        left_ratio = (self.handle_left_x - self.handle_width) / usable_width
+        right_ratio = (self.handle_right_x - self.handle_width) / usable_width
+        
+        start_seconds = max(0, left_ratio * self.video_duration)
+        end_seconds = min(self.video_duration, right_ratio * self.video_duration)
+        
+        # Format as HH:MM:SS
+        self.start_time.set(self.format_time(start_seconds))
+        self.end_time.set(self.format_time(end_seconds))
+    
+    def format_time(self, seconds):
+        """Format seconds as HH:MM:SS."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    
+    def load_video_timeline(self, video_path):
+        """Load video and generate timeline thumbnails."""
+        try:
+            # Get video duration
+            self.video_duration = self.get_video_duration(video_path)
+            
+            # Generate thumbnails in background thread
+            thread = threading.Thread(target=self._generate_thumbnails, args=(video_path,))
+            thread.daemon = True
+            thread.start()
+        except Exception as e:
+            print(f"Error loading timeline: {e}")
+    
+    def _generate_thumbnails(self, video_path):
+        """Generate thumbnail images from video (runs in background thread)."""
+        try:
+            import tempfile
+            
+            # Create temp directory for thumbnails
+            temp_dir = tempfile.mkdtemp()
+            
+            # Generate ~10 thumbnails evenly spaced
+            num_thumbnails = 10
+            interval = self.video_duration / num_thumbnails
+            
+            ffmpeg_path = get_ffmpeg_path('ffmpeg')
+            thumbnails = []
+            
+            for i in range(num_thumbnails):
+                timestamp = i * interval
+                output_path = os.path.join(temp_dir, f"thumb_{i}.png")
+                
+                cmd = [
+                    ffmpeg_path, '-y',
+                    '-ss', str(timestamp),
+                    '-i', video_path,
+                    '-vframes', '1',
+                    '-vf', 'scale=60:40',
+                    output_path
+                ]
+                
+                subprocess.run(cmd, capture_output=True, timeout=10, creationflags=SUBPROCESS_FLAGS)
+                
+                if os.path.exists(output_path):
+                    thumbnails.append(output_path)
+            
+            self.thumbnails = thumbnails
+            self.timeline_loaded = True
+            
+            # Initialize handle positions
+            self.handle_left_x = self.handle_width
+            self.handle_right_x = self.timeline_width - self.handle_width if self.timeline_width > 0 else 580
+            
+            # Update UI on main thread
+            self.root.after(0, self.draw_timeline)
+            
+        except Exception as e:
+            print(f"Error generating thumbnails: {e}")
+    
+    def draw_timeline(self):
+        """Draw the timeline with thumbnails and handles."""
+        if not self.timeline_loaded:
+            return
+        
+        self.timeline_canvas.delete("all")
+        
+        canvas_width = self.timeline_width if self.timeline_width > 0 else 580
+        canvas_height = 70
+        
+        # Draw thumbnails
+        if self.thumbnails:
+            try:
+                from PIL import Image, ImageTk
+                
+                thumb_width = (canvas_width - self.handle_width * 2) // len(self.thumbnails)
+                
+                # Store photo references to prevent garbage collection
+                if not hasattr(self, 'photo_refs'):
+                    self.photo_refs = []
+                self.photo_refs.clear()
+                
+                for i, thumb_path in enumerate(self.thumbnails):
+                    if os.path.exists(thumb_path):
+                        img = Image.open(thumb_path)
+                        img = img.resize((thumb_width, 50), Image.Resampling.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        self.photo_refs.append(photo)
+                        
+                        x = self.handle_width + i * thumb_width
+                        self.timeline_canvas.create_image(x, 10, image=photo, anchor="nw")
+            except ImportError:
+                # PIL not available, draw placeholder rectangles
+                thumb_width = (canvas_width - self.handle_width * 2) // 10
+                for i in range(10):
+                    x = self.handle_width + i * thumb_width
+                    color = "#444" if i % 2 == 0 else "#555"
+                    self.timeline_canvas.create_rectangle(x, 10, x + thumb_width, 60, fill=color, outline="")
+        
+        # Draw selected region overlay (dimmed outside selection)
+        self.timeline_canvas.create_rectangle(
+            0, 0, self.handle_left_x, canvas_height,
+            fill="#000", stipple="gray50", outline=""
+        )
+        self.timeline_canvas.create_rectangle(
+            self.handle_right_x, 0, canvas_width, canvas_height,
+            fill="#000", stipple="gray50", outline=""
+        )
+        
+        # Draw selection border (yellow like QuickTime)
+        self.timeline_canvas.create_rectangle(
+            self.handle_left_x, 2, self.handle_right_x, canvas_height - 2,
+            outline="#FFD700", width=3
+        )
+        
+        # Draw left handle
+        self.timeline_canvas.create_rectangle(
+            self.handle_left_x - self.handle_width // 2, 0,
+            self.handle_left_x + self.handle_width // 2, canvas_height,
+            fill="#FFD700", outline="#FFA500"
+        )
+        self.timeline_canvas.create_line(
+            self.handle_left_x, 15, self.handle_left_x, canvas_height - 15,
+            fill="#000", width=2
+        )
+        
+        # Draw right handle
+        self.timeline_canvas.create_rectangle(
+            self.handle_right_x - self.handle_width // 2, 0,
+            self.handle_right_x + self.handle_width // 2, canvas_height,
+            fill="#FFD700", outline="#FFA500"
+        )
+        self.timeline_canvas.create_line(
+            self.handle_right_x, 15, self.handle_right_x, canvas_height - 15,
+            fill="#000", width=2
+        )
+    
     def check_gpu_availability(self):
         """Check if NVIDIA GPU with NVENC is available."""
         try:
@@ -562,17 +1027,19 @@ class VideoCompressorGUI:
                 [ffmpeg_path, '-encoders'],
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=5,
+                creationflags=SUBPROCESS_FLAGS
             )
             
             if 'h264_nvenc' in result.stdout:
                 # NVENC encoder is available in FFmpeg
                 # Try a quick test to see if GPU is actually accessible
                 test_result = subprocess.run(
-                    [ffmpeg_path, '-f', 'lavfi', '-i', 'nullsrc=s=256x256:d=1', 
+                    [ffmpeg_path, '-f', 'lavfi', '-i', 'nullsrc=s=256x256:d=1',
                      '-c:v', 'h264_nvenc', '-f', 'null', '-'],
                     capture_output=True,
-                    timeout=10
+                    timeout=10,
+                    creationflags=SUBPROCESS_FLAGS
                 )
                 
                 if test_result.returncode == 0:
@@ -627,8 +1094,8 @@ def check_ffmpeg():
     try:
         ffmpeg_path = get_ffmpeg_path('ffmpeg')
         ffprobe_path = get_ffmpeg_path('ffprobe')
-        subprocess.run([ffmpeg_path, '-version'], capture_output=True, check=True)
-        subprocess.run([ffprobe_path, '-version'], capture_output=True, check=True)
+        subprocess.run([ffmpeg_path, '-version'], capture_output=True, check=True, creationflags=SUBPROCESS_FLAGS)
+        subprocess.run([ffprobe_path, '-version'], capture_output=True, check=True, creationflags=SUBPROCESS_FLAGS)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False

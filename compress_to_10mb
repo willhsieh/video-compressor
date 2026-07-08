@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# compress_to_10mb FILE [TARGET_MB=10]
+#
+# Compress a video to ≤ TARGET_MB using libx264 + AAC.
+# Mirrors the CPU-encoding path of video_compressor.py
+# (lines 324-339 for bitrate math, 469-481 for the ffmpeg flags),
+# minus the GUI and trimming.
+
+set -euo pipefail
+
+# ─── COLLISION POLICY ──────────────────────────────────────────────────────
+# If the output path already exists: notify, prompt, and on confirm pick the
+# next available "<base>-<N>.mp4" name. Default-no on Enter.
+on_exists() {
+  local out="$1"
+  if [ ! -e "$out" ]; then
+    printf '%s' "$out"
+    return
+  fi
+  echo "⚠  duplicate: $(basename "$out") already exists in $(dirname "$out")" >&2
+  read -rp "   proceed with auto-rename? [y/N] " ans </dev/tty
+  case "$ans" in
+    y|Y|yes|YES) ;;
+    *) echo "aborted." >&2; exit 1 ;;
+  esac
+  local n=1 base="${out%.mp4}"
+  while [ -e "${base}-${n}.mp4" ]; do n=$((n+1)); done
+  echo "   renaming to: $(basename "${base}-${n}.mp4")" >&2
+  printf '%s' "${base}-${n}.mp4"
+}
+# ───────────────────────────────────────────────────────────────────────────
+
+usage() { echo "usage: $(basename "$0") FILE [TARGET_MB=10]" >&2; exit 64; }
+
+INPUT="${1:-}"; [ -n "$INPUT" ] || usage
+[ -f "$INPUT" ] || { echo "error: not a file: $INPUT" >&2; exit 1; }
+TARGET_MB="${2:-10}"
+
+for cmd in ffmpeg ffprobe awk bc; do
+  command -v "$cmd" >/dev/null || { echo "error: $cmd not found" >&2; exit 1; }
+done
+
+DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$INPUT")
+FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$INPUT")
+NAUD=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$INPUT" | wc -l | tr -d ' ')
+[ "$NAUD" -lt 1 ] && NAUD=1
+
+# Bitrate math (matches video_compressor.py:324-339)
+#   target * 0.95 → 5% safety margin
+#   reserve 128 kbps for audio
+#   floor((remaining_bits / duration) / 1024) → kbps as fed to ffmpeg
+read -r VB AB <<<"$(awk -v dur="$DUR" -v tmb="$TARGET_MB" 'BEGIN{
+  emb = tmb * 0.95
+  tsb = emb * 8 * 1024 * 1024
+  ab  = 128
+  asb = ab * 1024 * dur
+  vsb = tsb - asb
+  if (vsb <= 0) { print "0 0"; exit }
+  printf "%d %d\n", int((vsb/dur)/1024), ab
+}')"
+[ "$VB" -gt 0 ] || { echo "error: $TARGET_MB MB too small for ${DUR}s @ ${AB}k audio" >&2; exit 2; }
+
+OUT_DIR=$(dirname -- "$INPUT")
+OUT_BASE=$(basename -- "${INPUT%.*}")
+OUTPUT=$(on_exists "$OUT_DIR/${OUT_BASE}_compressed.mp4")
+
+# Multi-track audio: mix down with amix filter (matches video_compressor.py:580-589)
+EXTRA=()
+if [ "$NAUD" -gt 1 ]; then
+  inputs=""
+  for ((i=0; i<NAUD; i++)); do inputs+="[0:a:$i]"; done
+  EXTRA=( -filter_complex "${inputs}amix=inputs=${NAUD}:duration=first:dropout_transition=2[aout]" \
+          -map 0:v:0 -map "[aout]" )
+fi
+
+echo ">> input:    $INPUT"
+echo ">> output:   $OUTPUT"
+echo ">> duration: ${DUR}s @ $FPS fps, $NAUD audio track(s)"
+echo ">> bitrate:  ${VB}k video + ${AB}k audio  (target: $TARGET_MB MB)"
+echo
+
+ffmpeg -y -i "$INPUT" \
+  ${EXTRA[@]+"${EXTRA[@]}"} \
+  -ac 2 \
+  -c:v libx264 -b:v "${VB}k" -maxrate "${VB}k" -bufsize "$((VB*2))k" \
+  -preset medium \
+  -r "$FPS" \
+  -c:a aac -b:a "${AB}k" \
+  -movflags +faststart \
+  "$OUTPUT"
+
+SIZE=$(stat -f "%z" "$OUTPUT")
+LIMIT=$((TARGET_MB * 1024 * 1024))
+MB=$(echo "scale=3; $SIZE/1048576" | bc)
+if [ "$SIZE" -le "$LIMIT" ]; then
+  printf "\n✓ %s MB  (under %d MB)\n" "$MB" "$TARGET_MB"
+else
+  printf "\n✗ %s MB EXCEEDS %d MB target\n" "$MB" "$TARGET_MB" >&2
+  exit 3
+fi

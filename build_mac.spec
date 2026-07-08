@@ -10,8 +10,8 @@ ffmpeg_dir = os.path.join(os.getcwd(), 'ffmpeg')
 binaries = []
 
 if os.path.exists(ffmpeg_dir):
-    ffmpeg_exe = os.path.join(ffmpeg_dir, 'ffmpeg.exe')
-    ffprobe_exe = os.path.join(ffmpeg_dir, 'ffprobe.exe')
+    ffmpeg_exe = os.path.join(ffmpeg_dir, 'ffmpeg')
+    ffprobe_exe = os.path.join(ffmpeg_dir, 'ffprobe')
     
     if os.path.exists(ffmpeg_exe):
         binaries.append((ffmpeg_exe, '.'))
@@ -21,11 +21,8 @@ if os.path.exists(ffmpeg_dir):
 # Collect tkinterdnd2 data files and DLLs
 datas = []
 try:
-    # Collect tkinterdnd2 data files (includes DLLs)
     tkdnd_datas = collect_data_files('tkinterdnd2')
     datas.extend(tkdnd_datas)
-    
-    # Also collect any dynamic libraries
     tkdnd_binaries = collect_dynamic_libs('tkinterdnd2')
     binaries.extend(tkdnd_binaries)
 except Exception as e:
@@ -50,9 +47,6 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
@@ -72,11 +66,26 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # No console window
+    console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
+    argv_emulation=True,  # Required for Mac
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None  # You can add an icon file path here if you have one
+    icon=None
+)
+
+# Create .app bundle for Mac
+app = BUNDLE(
+    exe,
+    name='VideoCompressor.app',
+    icon=None,
+    bundle_identifier='com.videocompressor.app',
+    info_plist={
+        'CFBundleName': 'Video Compressor',
+        'CFBundleDisplayName': 'Video Compressor',
+        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': '1.0.0',
+        'NSHighResolutionCapable': True,
+    },
 )

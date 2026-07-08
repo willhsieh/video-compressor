@@ -6,14 +6,17 @@ A simple GUI application for compressing video files to a specified maximum file
 
 - **Simple GUI** - Easy-to-use interface built with tkinter
 - **Drag-and-Drop Support** - Simply drag video files into the window to select them
-- **Target File Size** - Compress videos to meet a specific maximum file size
-- **Video Trimming** - Set start and end timestamps to compress only a portion of the video
+- **Target File Size** - Compress videos to meet a specific maximum file size (with 5% safety margin to ensure output never exceeds limit)
+- **Visual Timeline Trimming** - Interactive timeline with draggable handles to set trim points, similar to QuickTime
+- **Video Preview Scrubbing** - Real-time video preview updates as you drag the trim handles
+- **Thumbnail Timeline** - Visual thumbnail strip showing video content at a glance
+- **Reset Button** - Quickly reset the form to compress another video
 - **Audio Track Merging** - Automatically combines multiple audio tracks into a single track
 - **Smart Compression** - Calculates optimal bitrate to achieve target file size
 - **FPS Preservation** - Automatically detects and preserves the original video framerate
 - **GPU Acceleration** - Optional NVIDIA NVENC support for 5-10x faster encoding
 - **Automatic Fallback** - Gracefully falls back to CPU if GPU encoding fails
-- **Self-Contained Executable** - Option to bundle FFmpeg, making the executable fully standalone
+- **Self-Contained Executable** - Option to bundle FFmpeg and Pillow, making the executable fully standalone
 
 ## Requirements
 
@@ -26,6 +29,8 @@ A simple GUI application for compressing video files to a specified maximum file
 ### Development Requirements (for building from source)
 - **Python 3.7+**
 - **PyInstaller** (see `requirements.txt`)
+- **Pillow** - For video preview and timeline thumbnails
+- **tkinterdnd2** - For drag-and-drop support
 
 ## Usage
 
@@ -37,11 +42,14 @@ A simple GUI application for compressing video files to a specified maximum file
 4. Fill in the required fields:
    - **Input Video**: Drag-and-drop a video file or click Browse to select one
    - **Output Video**: Choose where to save the compressed video
-   - **Max File Size (MB)**: Enter the target maximum file size in megabytes
-   - **Start Time**: Starting timestamp (format: HH:MM:SS or seconds, default: 00:00:00)
-   - **End Time**: Ending timestamp (format: HH:MM:SS or seconds, leave empty for full video)
+   - **Max File Size (MB)**: Enter the target maximum file size in megabytes (default: 10 MB)
+   - **Video Preview**: Shows the current frame when scrubbing the timeline
+   - **Timeline**: Drag the yellow handles to set trim start/end points visually
+   - **Start Time**: Starting timestamp (auto-updated when dragging timeline, or enter manually)
+   - **End Time**: Ending timestamp (auto-updated when dragging timeline, or enter manually)
    - **Use GPU Acceleration**: Check this box to use NVIDIA GPU encoding (if available)
 5. Click "Compress Video" to start the process
+6. Click "Reset" to clear the form and compress another video
 
 ### Running from Source
 
@@ -215,6 +223,7 @@ This creates a smaller executable, but users must install FFmpeg separately.
 
 - **GUI Framework**: tkinter (built into Python)
 - **Drag-and-Drop**: tkinterdnd2 (bundled in executable)
+- **Image Processing**: Pillow (for video preview and timeline thumbnails)
 - **Video Processing**: FFmpeg
 - **Video Codecs**: 
   - **GPU**: H.264 (h264_nvenc) with NVENC preset p4
@@ -226,7 +235,7 @@ This creates a smaller executable, but users must install FFmpeg separately.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is provided as-is for educational and personal use.
 
 ## Credits
 
