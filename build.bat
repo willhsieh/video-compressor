@@ -12,6 +12,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Python 3.10.0 has a bytecode bug that crashes PyInstaller's module scan
+REM with "IndexError: tuple index out of range" - fixed in Python 3.10.1+
+python -c "import sys; sys.exit(sys.version_info[:3] == (3, 10, 0))"
+if errorlevel 1 (
+    echo Error: Python 3.10.0 has a known bug that breaks PyInstaller builds.
+    echo Install Python 3.10.11 or newer from https://www.python.org/downloads/
+    echo then run this script again.
+    pause
+    exit /b 1
+)
+
 REM Check for FFmpeg binaries
 if not exist "ffmpeg\ffmpeg.exe" (
     echo.

@@ -125,6 +125,11 @@ pyinstaller build_windows.spec --clean
 pyinstaller build_mac.spec --clean
 ```
 
+### "IndexError: tuple index out of range" during build
+Your Python is exactly 3.10.0, which has a bytecode bug that crashes
+PyInstaller's module scanning (PyInstaller issue #6301). Install Python
+3.10.11 or newer — any version except 3.10.0 works — and build again.
+
 ### Pillow import errors
 ```bash
 pip install --upgrade Pillow
