@@ -49,7 +49,9 @@ class VideoCompressorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Video Compressor")
-        self.root.geometry("650x920")
+        # Let the window size itself to fit its content — a hardcoded height
+        # clips the bottom widgets (Compress button) when fonts/DPI differ
+        self.root.minsize(650, 0)
         self.root.resizable(False, False)
         
         # Variables
@@ -1084,7 +1086,12 @@ def get_ffmpeg_path(executable_name):
     local_path = os.path.join(app_dir, f'{executable_name}.exe')
     if os.path.exists(local_path):
         return local_path
-    
+
+    # Check the ffmpeg subdirectory (where download_ffmpeg.py puts the binaries)
+    subdir_path = os.path.join(app_dir, 'ffmpeg', f'{executable_name}.exe')
+    if os.path.exists(subdir_path):
+        return subdir_path
+
     # Fall back to system PATH
     return executable_name
 
